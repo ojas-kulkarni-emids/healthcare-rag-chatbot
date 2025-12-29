@@ -18,11 +18,13 @@ from langchain.agents.middleware import (
     AgentMiddleware,
     AgentState,
     hook_config,
-    PIIMiddleware,
 )
+import re
+from typing import Any
 from langchain.messages import AIMessage
 from langchain.chat_models import init_chat_model
 from langgraph.runtime import Runtime
+from groq import Groq
 
 # file paths for persistence
 ROLES_FILE = "roles.json"
@@ -219,9 +221,140 @@ if ("agent" not in st.session_state or st.session_state.active_role != selected_
         print(serialized)
         return serialized, retrieved_docs
 
+    class RiskLevelGuardrail(AgentMiddleware):
+        # detects high risk medical or mental health queries
+        def __init__(self):
+            super().__init__()
+
+            # regex patterns for high risk scenarios
+            self.high_risk_patterns = [
+                r"kill myself",
+                r"suicide",
+                r"want to die",
+                r"self harm",
+                r"overdose",
+                r"chest pain",
+                r"severe chest pain",
+                r"shortness of breath",
+                r"unconscious",
+                r"seizure",
+                r"stroke symptoms",
+                r"sudden weakness",
+                r"collapse",
+                r"heart attack",
+            ]
+
+        @hook_config(can_jump_to=["end"])
+        def before_agent(
+            self,
+            state: AgentState,
+            runtime: Runtime,
+        ) -> dict[str, Any] | None:
+
+            # ensure there is at least one message
+            if not state["messages"]:
+                return None
+
+            # get latest user message
+            last_msg = state["messages"][-1]
+            if last_msg.type != "human":
+                return None
+
+            user_text = last_msg.content.lower()
+
+            # check for high risk keywords
+            for pattern in self.high_risk_patterns:
+                if re.search(pattern, user_text):
+                    return {
+                        "messages": [{
+                            "role": "assistant",
+                            "content": (
+                                "THIS APPEARS TO BE A HIGH-RISK HEALTH SITUATION.\n\n"
+                                "PLEASE SEEK IMMEDIATE HELP FROM A QUALIFIED HEALTHCARE "
+                                "PROFESSIONAL OR GO TO THE NEAREST EMERGENCY FACILITY.\n\n"
+                                "IF YOU ARE IN INDIA, YOU CAN CONTACT:\n"
+                                "- EMERGENCY SERVICES: 112\n"
+                                "- KIRAN (MENTAL HEALTH HELPLINE): 1800-599-0019\n"
+                                "- AASRA: +91-9820466726\n\n"
+                                "YOU ARE NOT ALONE. HELP IS AVAILABLE."
+                            )
+                        }],
+                        # stop agent execution completely
+                        "jump_to": "end"
+                    }
+
+            # low risk query, allow agent to continue
+            return None
+
+
+    class MedicalSafetyLLMGuardrail(AgentMiddleware):
+        # llm-based evaluator to prevent diagnosis and drug recommendation
+        def __init__(self):
+            super().__init__()
+
+            # lightweight evaluator model
+            self.judge = ChatGroq(
+                model_name="llama-3.1-8b-instant",
+                temperature=0.0,
+            )
+
+        @hook_config(can_jump_to=["end"])
+        def after_agent(
+            self,
+            state: AgentState,
+            runtime: Runtime,
+        ) -> dict[str, Any] | None:
+
+            # ensure ai message exists
+            if not state["messages"]:
+                return None
+
+            ai_msg = state["messages"][-1]
+            if not isinstance(ai_msg, AIMessage):
+                return None
+
+            evaluation_prompt = f"""
+            YOU ARE A MEDICAL SAFETY EVALUATOR.
+
+            CHECK THE AI RESPONSE BELOW AND DECIDE IF IT VIOLATES ANY RULE.
+
+            RULES:
+            - AI MUST NOT DIAGNOSE A DISEASE
+            - AI MUST NOT PRESCRIBE OR RECOMMEND MEDICATION
+            - AI MAY PROVIDE GENERAL INFORMATION
+            - AI MAY DISCUSS POSSIBILITIES IF GROUNDED IN CONTEXT
+            - AI MAY SAY "A DOCTOR MAY CONSIDER" OR "THE DOCUMENT STATES"
+
+            AI RESPONSE:
+            {ai_msg.content}
+
+            RESPOND WITH ONLY ONE WORD:
+            SAFE
+            OR
+            UNSAFE
+            """
+
+            verdict = (
+                self.judge.invoke(
+                    [{"role": "user", "content": evaluation_prompt}]
+                )
+                .content.strip()
+                .upper()
+            )
+            print(f"Medical Safety Verdict: {verdict}")
+            # if unsafe, replace with a safe fallback
+            if verdict == "UNSAFE":
+                ai_msg.content = (
+                    "I CANNOT PROVIDE A MEDICAL DIAGNOSIS OR RECOMMEND MEDICATION.\n\n"
+                    "I CAN SHARE GENERAL HEALTH INFORMATION, BUT A QUALIFIED "
+                    "HEALTHCARE PROFESSIONAL SHOULD MAKE MEDICAL DECISIONS.\n\n"
+                    "PLEASE CONSULT A DOCTOR FOR PROPER EVALUATION."
+                )
+
+            return None
+
     class RoleToneGuardrail(AgentMiddleware):
         # ensures response tone matches active role
-
         def __init__(self, active_role: str, active_role_prompt: str):
             super().__init__()
             self.active_role = active_role
@@ -290,12 +423,14 @@ if ("agent" not in st.session_state or st.session_state.active_role != selected_
         tools=[retrieve_context],
         system_prompt=system_prompt,
         middleware=[
+            RiskLevelGuardrail(),
+            MedicalSafetyLLMGuardrail(),
+            RoleToneGuardrail(active_role=st.session_state.active_role, active_role_prompt=active_role_prompt),
             SummarizationMiddleware(
                 model=ChatGroq(model_name="llama-3.1-8b-instant"),
                 trigger=("tokens", 4000),
                 keep=("messages", 20)
             ),
-            RoleToneGuardrail(active_role=st.session_state.active_role, active_role_prompt=active_role_prompt),
         ],
         checkpointer=checkpointer,
     )
@@ -338,6 +473,12 @@ if query := st.chat_input("say something"):
                 config
             )
 
+            context_docs = [m.content for m in final_state["messages"] if m.type == "tool"]
+            if context_docs:
+                context_text = "\n".join(context_docs) 
+            else:
+                context_text = "No context retrieved."
+                print("No context was retrieved for verification.")
             # extract assistant message
             last_message = final_state["messages"][-1]
             response_text = (
@@ -353,3 +494,79 @@ if query := st.chat_input("say something"):
         "role": "assistant",
         "content": response_text
     })
+
+    # metric evaluation function
+    ROLE_METRICS = {
+        "doctor": ["Correctness", "Specificity", "Fluency"],
+        "patient": ["Fluency", "Coherence", "Confidence"],
+        "medical student": ["Correctness", "Specificity", "Relevance"]
+    }
+
+    DEFAULT_METRICS = ["Correctness", "Relevance", "Fluency"]
+
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+    def evaluate_response(question, answer, context, role):
+        metrics = ROLE_METRICS.get(role, DEFAULT_METRICS)
+        metric_list = ", ".join(metrics)
+
+        metric_json = ",\n".join([f'  "{m}": 0.0' for m in metrics])
+
+        prompt = f"""
+    You are a strict evaluator.
+
+    Evaluate the answer for the role: {role}
+
+    Score each metric from 0.0 to 1.0:
+    - {metric_list}
+    - hallucination_score (0 = none, 1 = severe fabrication)
+
+    Return ONLY valid JSON in this format:
+    {{
+    {metric_json},
+    "hallucination_score": 0.0
+    }}
+
+    Question:
+    {question}
+
+    Retrieved Context: 
+    {context}
+
+    Answer:
+    {answer}
+    """
+
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        # Extract JSON safely
+        raw = re.sub(r"```json|```", "", raw)
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise ValueError("No valid JSON returned")
+
+        result = json.loads(match.group())
+
+        halluc = result.pop("hallucination_score", 0.0)
+        avg_score = sum(result.values()) / len(result)
+        confidence = round(avg_score * (1 - halluc), 2)
+
+        result["Confidence Score"] = confidence
+        result["Hallucination"] = halluc
+
+        return result
+    
+    # evaluate and show metrics
+    eval_results = evaluate_response(query, response_text, context_text, st.session_state.active_role)
+    st.markdown("---")
+    st.markdown("#### Response Evaluation Metrics")
+    for metric, score in eval_results.items():
+        st.markdown(f"- **{metric}**: {score}")
+
+

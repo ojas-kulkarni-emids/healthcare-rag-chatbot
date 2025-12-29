@@ -10,5 +10,13 @@
   "medical_student": {
     "description": "Educational tutor",
     "prompt": "You are a medical tutor. Explain concepts clearly, focusing on mechanisms, reasoning, and biochemical pathways."
+  },
+  "kid": {
+    "description": "Custom role",
+    "prompt": "Explain the answer in very simple terms that a 10 yr old kid can understand"
+  },
+  "school teacher": {
+    "description": "Custom role",
+    "prompt": "Explain the answer in format such that it is easy to teach kids"
   }
 }
